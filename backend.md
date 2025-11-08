@@ -17,16 +17,17 @@
    8. [构建与工程配置](#构建与工程配置)
 2. [后端（Go + Gin）开发指引](#后端go--gin开发指引)
    1. [目标与架构](#目标与架构)
-   2. [项目结构建议](#项目结构建议)
-   3. [环境依赖与本地开发流程](#环境依赖与本地开发流程)
-   4. [数据库模型](#数据库模型)
-   5. [API 设计与错误码](#api-设计与错误码)
-   6. [业务流程细化](#业务流程细化)
-   7. [安全与合规要求](#安全与合规要求)
-   8. [测试策略](#测试策略)
-   9. [部署与运维](#部署与运维)
-   10. [与前端的联调约定](#与前端的联调约定)
-   11. [后续可扩展方向](#后续可扩展方向)
+   2. [项目结构建议（CLD 分层）](#项目结构建议cld-分层)
+   3. [配置、日志与启动流程](#配置日志与启动流程)
+   4. [环境依赖与本地开发流程](#环境依赖与本地开发流程)
+   5. [数据库模型](#数据库模型)
+   6. [API 设计与错误码](#api-设计与错误码)
+   7. [业务流程细化](#业务流程细化)
+   8. [安全与合规要求](#安全与合规要求)
+   9. [测试策略](#测试策略)
+   10. [部署与运维](#部署与运维)
+   11. [与前端的联调约定](#与前端的联调约定)
+   12. [后续可扩展方向](#后续可扩展方向)
 
 ---
 
@@ -136,32 +137,101 @@ Pinia Store 统一采用组合式写法，支持组合调用：
 ### 目标与架构
 
 - **核心目标**：围绕单台 PS5 资源提供预约、下单、手动支付核验的 RESTful API；保障用户在 1 分钟内完成登录与下单，管理员可及时核验付款。
-- **架构层次**：
-  1. **API 层**：Gin 路由 + 控制器，负责请求校验、响应序列化。
-  2. **Service 层**：封装业务流程（预约锁定、订单状态机、凭证处理）。
-  3. **Repository 层**：集中处理数据库 CRUD/事务，建议使用 `sqlx` 或 `gorm`（根据团队偏好）。
-  4. **Job 层**：定时扫描过期订单释放资源，或在请求路径中惰性校验。
-  5. **Integration 层**：对接微信登录、对象存储（凭证图片）、配置中心等。
+- **CLD 分层理念**：完全对齐练习仓库 [rym1e/bluebell](https://github.com/rym1e/bluebell) 的组织方式，以 **Controller → Logic → DAO** 为主轴，配合配置、日志、路由、工具等辅助模块。
+  - **Controller 层（controller/）**：接受路由调用，负责参数绑定、业务入口、响应处理，与 `validator` 翻译器结合提供中文错误提示。
+  - **Logic 层（logic/）**：承载核心业务规则，聚合多个 DAO 调用并处理事务边界、状态机流转、缓存更新等；保证控制器轻量且可测试。
+  - **DAO 层（dao/mysql, dao/redis）**：封装数据库访问细节，统一返回业务需要的数据结构，提供缓存兜底策略。
+  - **共享包（pkg/）**：雪花算法、JWT、加密工具等通用能力复用。
+  - **配置（setting/）与日志（logger/）**：使用 Viper 加载多环境配置，使用 Zap 统一结构化日志。
+  - **路由（router/）与中间件（middleware/）**：集中注册 Gin 路由、JWT 鉴权、限流、恢复、跨域等中间件。
+  - **模型与响应（models/, pkg/response/）**：维护数据库模型、请求/响应结构体以及错误码定义。
 
-### 项目结构建议
+蓝图如下：外部请求首先进入 `router`，经中间件后调用对应 `controller`，由 `controller` 调用 `logic`，再由 `logic` 协调 `dao` 与 `pkg` 完成业务处理，最终返回统一响应。
+
+### 项目结构建议（CLD 分层）
+
+参考 bluebell 仓库的落地实践，推荐目录如下（如不使用 `cmd/` 目录，可直接在仓库根部放置 `main.go`，文档以 `cmd/server/main.go` 为例）：
 
 ```
 backend/
-├── cmd/server/main.go          # 程序入口，加载配置并启动 HTTP 服务
-├── internal/
-│   ├── api/                    # 路由、请求响应 DTO、参数绑定
-│   ├── auth/                   # 登录流程、JWT 签发与校验
-│   ├── config/                 # 配置解析（环境变量/文件）
-│   ├── jobs/                   # 定时任务，如订单过期扫描
-│   ├── middleware/             # 日志、恢复、鉴权、限流
-│   ├── models/                 # 领域模型与状态枚举
-│   ├── repository/             # 数据访问层（含事务封装）
-│   ├── service/                # 业务用例：预约、订单、支付凭证
-│   └── utils/                  # 工具函数（时间、编号、响应封装）
-├── migrations/                 # SQL 迁移文件（up/down）
-├── scripts/                    # 开发辅助脚本（如 seed 数据、打包）
-└── go.mod / go.sum             # Go Modules 描述
+├── cmd/
+│   └── server/
+│       └── main.go            # 程序入口，与文档示例保持一致
+├── config/                    # 配置文件模板（config.yaml、config.prod.yaml 等）
+├── controller/                # Controller 层：HTTP handler、参数校验
+├── dao/
+│   ├── mysql/                 # MySQL 访问，包含初始化、CRUD、事务封装
+│   └── redis/                 # Redis 访问，缓存热门数据、限流等
+├── logic/                     # 业务逻辑层，处理预约、订单、审核流程
+├── middleware/                # JWT 鉴权、CORS、日志、限流、Recovery
+├── models/                    # 领域模型、数据库结构体、常量枚举
+├── pkg/
+│   ├── response/              # 统一响应与错误码包装
+│   ├── snowflake/             # 雪花算法 ID 生成
+│   ├── jwt/                   # Token 生成/解析
+│   └── utils/                 # 通用工具，如时间、密码、上传
+├── router/                    # Gin 路由注册，与 Controller 对应
+├── setting/                   # Viper 配置加载、结构体定义
+├── logger/                    # Zap 日志初始化、封装
+├── tasks/                     # 定时任务（订单过期扫描等）
+├── migrations/                # SQL 迁移脚本（up/down）
+├── scripts/                   # 辅助脚本，如数据导入、代码生成
+└── go.mod / go.sum            # Go Modules 描述
 ```
+
+> **提示**：`logic` 层严禁直接依赖 `controller`，保持单向依赖关系；DAO 层也不应该感知上层业务，专注于数据读写。
+
+### 配置、日志与启动流程
+
+- **Viper 配置加载（setting 包）**
+  - `setting/config.go` 定义全局 `Conf` 结构体，与 YAML/JSON 中的字段一一对应（如 `App`, `Log`, `MySQL`, `Redis`, `Snowflake`）。
+  - `Init()` 函数读取 `APP_ENV` 环境变量（默认为 `dev`），拼接配置文件名：`config.dev.yaml`、`config.prod.yaml` 等，并支持通过 `--config` 自定义路径。
+  - 使用 `viper.SetConfigFile` / `SetConfigName` + `AddConfigPath` 加载，再通过 `viper.Unmarshal` 填充结构体；同时 `viper.WatchConfig` 监听热更新需求。
+  - 常见配置段示例：
+
+    ```yaml
+    app:
+      mode: "dev"
+      port: 8080
+    log:
+      level: "debug"
+      filename: "logs/server.log"
+      max_size: 128
+      max_age: 7
+      max_backups: 10
+    mysql:
+      host: "127.0.0.1"
+      port: 3306
+      user: "root"
+      password: "secret"
+      dbname: "ps5_reservation"
+      max_open_conns: 50
+      max_idle_conns: 10
+    redis:
+      addr: "127.0.0.1:6379"
+      db: 0
+      password: ""
+    snowflake:
+      start_time: "2024-01-01"
+      machine_id: 1
+    ```
+
+- **Zap 日志（logger 包）**
+  - `logger/logger.go` 提供 `Init(cfg *setting.LogConfig, mode string)`，根据配置初始化 Zap，区分 `dev`（控制台彩色日志）与 `prod`（JSON + 文件滚动）。
+  - 使用 `zapcore.AddSync` + `lumberjack`（或自定义 hook）实现日志切割；设置全局 logger：`zap.ReplaceGlobals(logger)` 并返回 `*zap.Logger`。
+  - 在业务代码中通过 `zap.L().Info/Debug/Error` 记录关键日志，附带 `zap.String("order_no", ...)` 等字段。
+
+- **main.go 启动顺序**
+  - 与用户提供的示例一致，`init()` 确保 `APP_ENV` 默认值；`main()` 依次执行：
+    1. `setting.Init()`：加载配置到全局 `Conf`。
+    2. `logger.Init(&setting.Conf.LogConfig, setting.Conf.App.Mode)`：初始化 Zap。
+    3. `mysql.Init(setting.Conf.MySQLConfig)`、`redis.Init(setting.Conf.RedisConfig)`：完成数据库连接。
+    4. `snowflake.Init(setting.Conf.StartTime, setting.Conf.MachineID)`：准备 ID 生成器。
+    5. `controller.InitTrans("zh")`：注册验证器中文翻译。
+    6. `router.Setup(setting.Conf.App.Mode)`：组装 Gin 路由（含中间件）。
+    7. `http.Server` 优雅启动，监听 `Conf.App.Port`，并使用 `os/signal` + `context.WithTimeout` 优雅关闭。
+  - 关键错误统一使用 `zap.L().Fatal/Info` 输出，必要时 `panic`；`defer mysql.Close()`、`defer redis.Close()` 保证资源释放。
+
 
 ### 环境依赖与本地开发流程
 
